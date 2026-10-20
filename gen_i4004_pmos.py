@@ -17,13 +17,35 @@ Outputs (in --out):
   mcs4mem.va           the Verilog-A 4001 ROM + 4002 RAM model
   i4004_pmos.lib       the chip library alone
 
-  python3 gen_i4004_pmos.py                 # demo program
-  python3 gen_i4004_pmos.py --asm prog.asm  # your own 4004 assembly in ROM
-  python3 gen_i4004_pmos.py --verify        # gate-level check vs ISA model
+  python3 gen_i4004_pmos.py                    # demo program
+  python3 gen_i4004_pmos.py --asm prog.asm     # your 4004 assembly in the ROM
+  python3 gen_i4004_pmos.py --asm prog.asm --stop-at PASS
+                                               # choose where the SPICE window ends
+  python3 gen_i4004_pmos.py --verify           # gate-level check vs ISA model
 
-Assembler syntax: 'label:'  'MNEMONIC args'  'ORG addr'  'DB b,b,..'  ';comment'
-(Intel mnemonics, registers R0..R15, pairs P0..P7).  A label named 'halt'
-ends the generated simulation shortly after the program reaches it twice.
+Every run first executes the program on the generated netlist at gate level
+(seconds), checks it against an instruction-level 4004 model, prints the
+output-port writes, and estimates the ngspice run time of the SPICE window.
+
+The SPICE window starts at RESET and ends at the --stop-at label (default
+HALT): a label holding a "JUN to itself" loop ends 2 cycles after its second
+fetch, any other label --stop-extra (12) cycles after its first fetch; if the
+label is never reached the window is --cycles instruction cycles long.
+Each instruction cycle is 8 clock periods, ~20 s of ngspice time.
+
+Assembler (Intel mnemonics, two-pass, symbols case-insensitive):
+  label:              label (colon optional for a label in column 1)
+  NAME EQU expr       constant (also NAME = expr, NAME SET expr)
+  ORG expr            location counter        DB e1, e2   data bytes
+  END                 end of source           ; ...       comment
+  operands: R0-R15, P0-P7, numbers 12 0x0C $0C 0CH 0b1100 1100B 'c',
+            symbols, $ (current address), + - * / % & | ^ ~ << >> ( )
+  JCN/ISZ targets given as labels must lie in the ROM page of the next
+  instruction (the assembler reports an error otherwise); a plain number
+  <= 0FFh is taken as the in-page low byte.
+The Verilog-A memory model provides the ROM, RAM bank 0 (chips 0-3, all
+registers and status characters) and the ROM I/O ports; RAM starts cleared,
+ROM input ports read (7*n+3) mod 16, and the TEST pin is held at logic 0.
 """
 
 
@@ -1268,82 +1290,226 @@ ONEBYTE = {'NOP': 0x00, 'WRM': 0xE0, 'WMP': 0xE1, 'WRR': 0xE2, 'WPM': 0xE3, 'WR0
 REGOP = {'INC': 6, 'ADD': 8, 'SUB': 9, 'LD': 10, 'XCH': 11, 'BBL': 12, 'LDM': 13}
 
 
-def assemble(src):
-    """Tiny two-pass assembler. Syntax: 'label:'  'MNEM arg,arg'  'ORG n'  ';comment'."""
-    lines = []
-    for raw in src.strip().splitlines():
-        s = raw.split(';')[0].strip()
-        if s:
-            lines.append(s)
-    for pass_ in (0, 1):
-        labels = getattr(assemble, '_labels', {}) if pass_ else {}
-        rom, pc = [0] * 4096, 0
-        used = set()
-        listing = []
-        for s in lines:
-            while ':' in s:
-                lab, s = s.split(':', 1)
-                labels[lab.strip()] = pc
-                s = s.strip()
-            if not s:
-                continue
-            parts = s.replace(',', ' ').split()
-            mn, args = parts[0].upper(), parts[1:]
+class AsmError(ValueError):
+    pass
 
-            def val(x):
-                if pass_ == 0 and x in labels:
-                    return labels[x]
-                if x in labels:
-                    return labels[x]
-                if x.upper().startswith('P') and x[1:].isdigit():
-                    return int(x[1:])
-                if x.upper().startswith('R') and x[1:].isdigit():
-                    return int(x[1:])
-                try:
-                    return int(x, 0)
-                except ValueError:
-                    if pass_ == 0:
-                        return 0
-                    raise
+
+_TOK = re.compile(r"""\s*(?:
+    (?P<num>0[xX][0-9A-Fa-f]+|0[bB][01]+|0[oO][0-7]+|\$[0-9A-Fa-f]+
+           |[0-9][0-9A-Fa-f]*[Hh]|[01]+[Bb](?![0-9A-Fa-f])|[0-7]+[OoQq]|[0-9]+)
+  | (?P<chr>'[^']')
+  | (?P<id>[A-Za-z_.][A-Za-z0-9_.]*)
+  | (?P<op><<|>>|[-+*/%&|^~()])
+  | (?P<here>\$)
+)""", re.X)
+
+
+def _parse_num(t):
+    u = t.upper()
+    if u.startswith('0X'):
+        return int(t[2:], 16)
+    if u.startswith('0B') and len(t) > 2 and all(c in '01' for c in t[2:]):
+        return int(t[2:], 2)
+    if u.startswith('0O'):
+        return int(t[2:], 8)
+    if t.startswith('$'):
+        return int(t[1:], 16)
+    if u.endswith('H'):
+        return int(t[:-1], 16)
+    if u.endswith('B'):
+        return int(t[:-1], 2)
+    if u[-1] in 'OQ':
+        return int(t[:-1], 8)
+    return int(t, 10)
+
+
+def _eval(expr, syms, pc, final, where, used_names=None):
+    """Evaluate an assembler expression: numbers (dec, 0x/$/..H hex, 0b/..B bin),
+    'c', symbols, $ (current address), R<n>/P<n>, + - * / % & | ^ ~ << >> ( )."""
+    import ast
+    out, pos, expr = [], 0, expr.strip()
+    while pos < len(expr):
+        m = _TOK.match(expr, pos)
+        if not m or m.end() == pos:
+            raise AsmError(f'{where}: cannot parse expression "{expr}"')
+        pos = m.end()
+        if m.group('num'):
+            out.append(str(_parse_num(m.group('num'))))
+        elif m.group('chr'):
+            out.append(str(ord(m.group('chr')[1])))
+        elif m.group('id'):
+            name = m.group('id').upper()
+            if used_names is not None:
+                used_names.add(name)
+            if name in syms:
+                out.append(str(syms[name]))
+            elif re.fullmatch(r'[RP]\d{1,2}', name):
+                out.append(str(int(name[1:])))
+            elif final:
+                raise AsmError(f'{where}: undefined symbol "{m.group("id")}"')
+            else:
+                out.append('0')
+        elif m.group('here'):
+            out.append(str(pc))
+        else:
+            op = m.group('op')
+            out.append('//' if op == '/' else op)
+    node = ast.parse(' '.join(out), mode='eval')
+    ops = {ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b,
+           ast.Mult: lambda a, b: a * b, ast.FloorDiv: lambda a, b: a // b,
+           ast.Mod: lambda a, b: a % b, ast.BitAnd: lambda a, b: a & b,
+           ast.BitOr: lambda a, b: a | b, ast.BitXor: lambda a, b: a ^ b,
+           ast.LShift: lambda a, b: a << b, ast.RShift: lambda a, b: a >> b}
+
+    def ev(n):
+        if isinstance(n, ast.Expression):
+            return ev(n.body)
+        if isinstance(n, ast.Constant) and isinstance(n.value, int):
+            return n.value
+        if isinstance(n, ast.BinOp) and type(n.op) in ops:
+            return ops[type(n.op)](ev(n.left), ev(n.right))
+        if isinstance(n, ast.UnaryOp):
+            v = ev(n.operand)
+            if isinstance(n.op, ast.USub):
+                return -v
+            if isinstance(n.op, ast.UAdd):
+                return v
+            if isinstance(n.op, ast.Invert):
+                return ~v
+        raise AsmError(f'{where}: bad expression "{expr}"')
+    return ev(node)
+
+
+def _split_operands(s):
+    """Operands are comma separated; 'JCN 4 LABEL' (blank separated) also works."""
+    if not s.strip():
+        return []
+    parts = [p.strip() for p in s.split(',')]
+    if len(parts) == 1:
+        toks = s.split()
+        if len(toks) == 2 and not re.search(r'[-+*/%&|^~(<>]$', toks[0]) \
+                and not re.match(r'^[-+*/%&|^~)<>]', toks[1]):
+            return toks
+    return parts
+
+
+DIRECTIVES = {'ORG', 'EQU', 'SET', 'DB', 'DATA', 'BYTE', 'END', '='}
+
+
+def assemble(src):
+    """Two-pass Intel 4004 assembler.
+
+    label:            labels (colon optional when the label starts in column 1)
+    NAME EQU expr     constants (also NAME = expr, NAME SET expr)
+    ORG expr          set the location counter
+    DB e1, e2, ...    data bytes (also DATA / BYTE)
+    END               stop assembling
+    ; comment         comments
+    Operands are expressions: numbers (12, 0x0C, $0C, 0CH, 0b1100, 1100B, 'c'),
+    symbols, $ (current address), R0-R15 / P0-P7, and + - * / % & | ^ ~ << >> ( ).
+    Symbols are case-insensitive.  JCN/ISZ targets are checked to lie in the
+    ROM page of the following instruction (as the 4004 requires)."""
+    lines = []
+    for n, raw in enumerate(src.splitlines(), 1):
+        s = raw.split(';')[0].rstrip()
+        if s.strip():
+            lines.append((n, s))
+    syms, label_names = {}, set()
+    for final in (False, True):
+        rom, pc = [0] * 4096, 0
+        used, listing, labels = {}, [], {}
+        for n, s in lines:
+            where = f'line {n}'
+            text = s
+            # labels
+            while True:
+                m = re.match(r'^\s*([A-Za-z_.][A-Za-z0-9_.]*)\s*:(?!=)\s*(.*)$', text)
+                if not m:
+                    break
+                name = m.group(1).upper()
+                if name in labels and labels[name] != pc and final:
+                    raise AsmError(f'{where}: label {m.group(1)} defined twice')
+                labels[name] = pc
+                syms[name] = pc
+                text = m.group(2)
+            if not text.strip():
+                continue
+            toks = text.split(None, 1)
+            first = toks[0].upper()
+            rest = toks[1] if len(toks) > 1 else ''
+            # NAME EQU expr / NAME = expr / NAME SET expr
+            m = re.match(r'^\s*([A-Za-z_.][A-Za-z0-9_.]*)\s*(?:\b(EQU|SET)\b|=)\s*(.+)$', text, re.I)
+            if m and m.group(1).upper() not in ONEBYTE and m.group(1).upper() not in DIRECTIVES:
+                syms[m.group(1).upper()] = _eval(m.group(3), syms, pc, final, where)
+                continue
+            # label without colon in column 1, followed by an instruction
+            known = set(ONEBYTE) | set(REGOP) | DIRECTIVES | {
+                'SRC', 'FIN', 'JIN', 'FIM', 'JUN', 'JMS', 'JCN', 'ISZ'}
+            if not s[0].isspace() and first not in known and rest \
+                    and rest.split()[0].upper() in known:
+                labels[first] = pc
+                syms[first] = pc
+                toks = rest.split(None, 1)
+                first = toks[0].upper()
+                rest = toks[1] if len(toks) > 1 else ''
+            mn = first
+            ops = _split_operands(rest)
+
+            def val(i, lo=None, hi=None, what='operand'):
+                if i >= len(ops):
+                    raise AsmError(f'{where}: {mn} needs {i+1} operand(s): "{s.strip()}"')
+                v = _eval(ops[i], syms, pc, final, where)
+                if final and lo is not None and not lo <= v <= hi:
+                    raise AsmError(f'{where}: {what} {v} out of range {lo}..{hi}: "{s.strip()}"')
+                return v
+            if mn == 'END':
+                break
             if mn == 'ORG':
-                pc = val(args[0])
+                pc = val(0, 0, 4095, 'address')
                 continue
             start = pc
             if mn in ONEBYTE:
                 code = [ONEBYTE[mn]]
             elif mn in REGOP:
-                code = [REGOP[mn] << 4 | val(args[0])]
+                v = val(0, 0, 15, 'register' if mn in ('INC', 'ADD', 'SUB', 'LD', 'XCH') else 'value')
+                code = [REGOP[mn] << 4 | v]
             elif mn == 'SRC':
-                code = [0x21 | val(args[0]) << 1]
+                code = [0x21 | val(0, 0, 7, 'pair') << 1]
             elif mn == 'FIN':
-                code = [0x30 | val(args[0]) << 1]
+                code = [0x30 | val(0, 0, 7, 'pair') << 1]
             elif mn == 'JIN':
-                code = [0x31 | val(args[0]) << 1]
+                code = [0x31 | val(0, 0, 7, 'pair') << 1]
             elif mn == 'FIM':
-                code = [0x20 | val(args[0]) << 1, val(args[1]) & 0xFF]
+                code = [0x20 | val(0, 0, 7, 'pair') << 1, val(1, 0, 255, 'data')]
             elif mn in ('JUN', 'JMS'):
-                a = val(args[0])
+                a = val(0, 0, 4095, 'address')
                 code = [(0x40 if mn == 'JUN' else 0x50) | a >> 8, a & 0xFF]
-            elif mn == 'JCN':
-                a = val(args[1])
-                code = [0x10 | val(args[0]), a & 0xFF]
-            elif mn == 'ISZ':
-                a = val(args[1])
-                code = [0x70 | val(args[0]), a & 0xFF]
-            elif mn == 'DB':
-                code = [val(x) & 0xFF for x in args]
+            elif mn in ('JCN', 'ISZ'):
+                c = val(0, 0, 15, 'condition' if mn == 'JCN' else 'register')
+                names = set()
+                a = _eval(ops[1], syms, pc, final, where, names) if len(ops) > 1 else val(1)
+                # a plain number <= FFh is taken as the in-page low byte; a label
+                # (full address) must lie in the page of the next instruction
+                if final and (names & label_names) and (a & 0xF00) != ((start + 2) & 0xF00):
+                    raise AsmError(f'{where}: {mn} target {ops[1]} = {a:03X}h is not in ROM page '
+                                   f'{(start + 2) >> 8:X} (the page of the next instruction); '
+                                   f'move code or use JUN: "{s.strip()}"')
+                code = [(0x10 if mn == 'JCN' else 0x70) | c, a & 0xFF]
+            elif mn in ('DB', 'DATA', 'BYTE'):
+                code = [_eval(x, syms, pc, final, where) & 0xFF for x in ops]
             else:
-                raise ValueError('unknown mnemonic ' + mn)
+                raise AsmError(f'{where}: unknown mnemonic "{toks[0]}": "{s.strip()}"')
             for byte in code:
-                if pc in used:
-                    raise ValueError(f'ROM overlap at {pc:03X} ({s})')
-                used.add(pc)
+                if final and pc in used:
+                    raise AsmError(f'{where}: ROM address {pc:03X}h already used by line {used[pc]}')
+                if pc > 4095:
+                    raise AsmError(f'{where}: program runs past 0xFFF')
+                used[pc] = n
                 rom[pc] = byte
                 pc += 1
-            listing.append((start, code, s))
-        assemble._labels = labels
+            listing.append((start, code, s.strip()))
+        label_names = set(labels)
     return rom, listing, labels
-
 
 
 DIRECTED = """
@@ -1638,25 +1804,73 @@ def zero_mem():
     return mem
 
 
-def demo_trace(chip, rom, labels, max_cycles=400):
-    """Run the program at gate level with a zero-initialised MCS-4 memory
-    system; stop two cycles after the second fetch of label 'halt' (if any)."""
+class LogMem(MemState):
+    """MCS-4 memory state that also logs every I/O write with its cycle number."""
+    def __init__(self, base):
+        self.__dict__.update(base.__dict__)
+        self.log, self.cyc = [], 0
+
+    def io_write(self, cmd, banks, val):
+        names = {0: 'WRM', 1: 'WMP', 2: 'WRR', 3: 'WPM', 4: 'WR0', 5: 'WR1', 6: 'WR2', 7: 'WR3'}
+        where = (f'ROM port {self.rom_src}' if cmd == 2 else
+                 f'RAM bank{"s" if len(banks) > 1 else ""} {",".join(map(str, banks))} '
+                 + ('chip %d' % self.ram_src[banks[0]][0] if banks else ''))
+        if cmd in (1, 2):
+            self.log.append((self.cyc, names[cmd], where, val))
+        MemState.io_write(self, cmd, banks, val)
+
+
+def demo_trace(chip, rom, labels, max_cycles=1000, stop_at='HALT', stop_extra=12):
+    """Run the program on the ISA model and at gate level (zero-initialised
+    MCS-4 memory, bank 0 RAM).  The run ends at the stop label:
+      * label holding a 'JUN to itself' loop -> 2 cycles after its 2nd fetch
+      * any other label                      -> stop_extra cycles after 1st fetch
+    or after max_cycles.  Returns the period-by-period trace for the decks."""
+    info = {}
+    gmem = LogMem(zero_mem())
+    gold = Golden(rom, gmem, lambda c: 0)
+    gstates = [gold.state()]
+    stop = None
+    lab = (stop_at or '').upper()
+    addr = labels.get(lab)
+    selfloop = addr is not None and rom[addr] >> 4 == 4 and \
+        ((rom[addr] & 15) << 8 | rom[(addr + 1) & 0xFFF]) == addr
+    search = max(max_cycles, 200000) if addr is not None else max_cycles
+    hits, scanned = [], 0
+    while gold.cycles < search:
+        gmem.cyc = gold.cycles
+        gold.step()
+        if gold.cycles <= max_cycles or (addr is not None and len(gstates) <= 200000):
+            gstates.append(gold.state())
+        if addr is not None and stop is None:
+            while scanned < len(gold.fetches):
+                if gold.fetches[scanned] == addr:
+                    hits.append(scanned)
+                scanned += 1
+            if selfloop and len(hits) >= 2:
+                stop = hits[1] + 2
+            elif not selfloop and hits:
+                stop = hits[0] + stop_extra
+        if stop is not None and gold.cycles >= stop:
+            break
+    ncycles = stop if stop is not None else max_cycles
+    gstates = gstates[:ncycles + 1]
+    info['stopped_at_label'] = stop is not None
+    info['iolog'] = [x for x in gmem.log if x[0] < ncycles]
+    # gate-level run of the generated netlist over the same window
     sim = LogicSim(chip)
     rec = []
     mem = zero_mem()
-    bus, _ = run_gate(sim, rom, mem, max_cycles, lambda c: 0, random.Random(5), rec)
-    ncycles = max_cycles
-    if 'halt' in labels:
-        hits = [i for i, a in enumerate(bus.fetches) if a == labels['halt']]
-        if len(hits) >= 2:
-            ncycles = hits[1] + 2
-    rec = rec[:RESET_PERIODS + 8 * ncycles]
-    # golden run for final memory state
-    gmem = zero_mem()
-    gold = Golden(rom, gmem, lambda c: 0)
-    while gold.cycles < ncycles:
-        gold.step()
-    return rec, ncycles, gmem
+    bus, snaps = run_gate(sim, rom, mem, ncycles, lambda c: 0, random.Random(5), rec)
+    n = min(len(snaps), len(gstates))
+    info['match'] = snaps[:n] == gstates[:n] and bus.fetches[:ncycles] == gold.fetches[:ncycles]
+    info['instructions'] = n
+    # final memory state at ncycles from a clean golden replay
+    fmem = zero_mem()
+    g2 = Golden(rom, fmem, lambda c: 0)
+    while g2.cycles < ncycles:
+        g2.step()
+    return rec, ncycles, fmem, info
 
 
 def wrr_events(rec):
@@ -2092,22 +2306,42 @@ TITLE_NG = """\
 *      -> mcs4mem.osdi
 *   2. ngspice -b i4004_pmos_va.cir      (writes i4004_pmos_va.raw)
 *      or open it interactively and plot v(rport) v(busval) v(sync)
-* To run another program: python3 gen_i4004_pmos.py --asm myprog.asm,
-* then repeat 1-2 (the ROM contents live in mcs4mem.va).
+* To run another program: python3 gen_i4004_pmos.py --asm myprog.asm
+* [--stop-at LABEL], then repeat 1-2 (the ROM contents live in mcs4mem.va).
+* To run longer than the generated window, raise .param NPER: the Verilog-A
+* memory keeps answering the CPU (the expected values listed below stop at
+* the end of the generated window).
 * Verified with ngspice-47 + OpenVAF-reloaded: ~20 min on one core.
 """
 
 
-def make_decks(chip, lib, rom, listing, labels, outdir, nchips=4, max_cycles=400):
-    rec, ncycles, gmem = demo_trace(chip, rom, labels, max_cycles)
+VERSION = '2026-10-18 (EQU/expression assembler, --stop-at)'
+
+SAVE_VECS = ('v(d0) v(d1) v(d2) v(d3) v(sync) v(cmrom) v(cmram0) v(cmram1) v(cmram2) v(cmram3)'
+             ' v(phi1) v(phi2) v(reset) v(busval)')
+LONG_RUN = 3000      # clock periods; above this the decks save only the pins
+
+
+def make_decks(chip, lib, rom, listing, labels, outdir, nchips=4, max_cycles=1000,
+               stop_at='HALT', stop_extra=12):
+    rec, ncycles, gmem, info = demo_trace(chip, rom, labels, max_cycles, stop_at, stop_extra)
     wrr = wrr_events(rec)
     nper = len(rec)
     common = TB_COMMON.format(nper=nper, nrst=RESET_PERIODS)
-    comment = program_comment(listing, wrr, 'Program in the external ROM')
+    comment = program_comment(listing, wrr[:200], 'Program in the external ROM')
+    if info['iolog']:
+        comment += '*\n*  Output-port writes expected from the ISA model (instruction cycle: value):\n'
+        comment += '\n'.join(f'*   cycle {c:6d}: {op} {where} <- {v}' for c, op, where, v in info['iolog'][:300])
+        comment += '\n'
+    long_run = nper > LONG_RUN
+    save_note = ('* long run: only the pins are saved (delete the .save line to keep every node)'
+                 if long_run else
+                 '* uncomment the .save line for long runs (keeps the output file small)')
 
     # ---------------- LTSpice (PWL memory playback)
-    lt = [TITLE_LT, DEVICE_KNOBS, lib, common, pwl_memory(rec), comment]
-    for k, (p, v) in enumerate(wrr):
+    lt = [TITLE_LT, DEVICE_KNOBS, lib, common, pwl_memory(rec), comment, save_note,
+          ('' if long_run else '*') + '.save ' + SAVE_VECS.replace('v(', 'V(') + ' I(VVDD)']
+    for k, (p, v) in enumerate(wrr[:40]):
         lt.append(f'.meas TRAN PORT_OUT{k+1} FIND V(busval) AT={{({p}+0.8)*TCLK}}')
     lt.append(f'.meas TRAN IDD_AVG AVG I(VVDD) FROM={{{RESET_PERIODS}*TCLK}} TO={{TSTOP}}')
     lt.append('.meas TRAN P_AVG PARAM IDD_AVG*VDDV')
@@ -2130,12 +2364,13 @@ def make_decks(chip, lib, rom, listing, labels, outdir, nchips=4, max_cycles=400
           'NMEM d0 d1 d2 d3 phi1 phi2 sync reset cmrom cmram0 rport mport mcs4mem_m',
           '.model mcs4mem_m mcs4mem',
           comment,
+          '.save ' + SAVE_VECS + ' v(rport) v(mport) i(vvdd)',
           '.tran {TCLK/40} {TSTOP} 0 {TCLK/40}',
           '.options klu',
           '.control',
           'pre_osdi mcs4mem.osdi',
           'run']
-    for k, (p, v) in enumerate(wrr):
+    for k, (p, v) in enumerate(wrr[:40]):
         ng.append(f'meas tran port_out{k+1} FIND v(rport) AT={(p + 1.5) * 1.35e-6:.6e}')
     ng += [f'meas tran idd_avg AVG i(vvdd) FROM={RESET_PERIODS * 1.35e-6:.4e} TO={nper * 1.35e-6:.6e}',
            'write i4004_pmos_va.raw v(d0) v(d1) v(d2) v(d3) v(sync) v(cmrom) v(cmram0) v(cmram1)'
@@ -2143,7 +2378,7 @@ def make_decks(chip, lib, rom, listing, labels, outdir, nchips=4, max_cycles=400
            '.endc', '.end']
     with open(os.path.join(outdir, 'i4004_pmos_va.cir'), 'w') as fh:
         fh.write('\n'.join(ng) + '\n')
-    return rec, ncycles, wrr, gmem
+    return rec, ncycles, wrr, gmem, info
 
 
 def main():
@@ -2151,10 +2386,22 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--verify', action='store_true', help='gate-level check vs ISA model')
     ap.add_argument('--asm', help='assembly file to put in ROM instead of the demo')
-    ap.add_argument('--cycles', type=int, default=400, help='max instruction cycles to simulate')
+    ap.add_argument('--stop-at', default='HALT', metavar='LABEL',
+                    help='end the simulated window at this label (default HALT; a "JUN to '
+                         'itself" label ends 2 cycles after its 2nd fetch, any other label '
+                         '--stop-extra cycles after its 1st fetch)')
+    ap.add_argument('--stop-extra', type=int, default=12, metavar='N',
+                    help='cycles to keep after a non-loop stop label (default 12)')
+    ap.add_argument('--cycles', type=int, default=1000,
+                    help='window length in instruction cycles if the stop label is not '
+                         'reached (default 1000)')
     ap.add_argument('--ram-chips', type=int, default=4, help='4002 chips modelled in bank 0')
     ap.add_argument('--out', default='.')
-    args = ap.parse_args()
+    # option names are accepted in any case (--STOP-AT == --stop-at)
+    argv = [(a.split('=', 1)[0].lower() + ('=' + a.split('=', 1)[1] if '=' in a else ''))
+            if a.startswith('--') else a for a in sys.argv[1:]]
+    args = ap.parse_args(argv)
+    print(f'gen_i4004_pmos.py version {VERSION}')
     chip = build_chip()
     lib, ntr = emit_library(chip)
     print(f'I4004P: {ntr} PMOS transistors')
@@ -2165,12 +2412,30 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, 'i4004_pmos.lib'), 'w') as fh:
         fh.write('* I4004P library - define PFET and .params RATIO LLOAD BSW PADW first\n' + lib)
-    rec, ncycles, wrr, gmem = make_decks(chip, lib, rom, listing, labels, args.out,
-                                         args.ram_chips, args.cycles)
+    print(f'assembled {sum(len(c) for _, c, _ in listing)} bytes'
+          + (f' from {args.asm}' if args.asm else ' (demo program)'))
+    rec, ncycles, wrr, gmem, info = make_decks(chip, lib, rom, listing, labels, args.out,
+                                               args.ram_chips, args.cycles, args.stop_at,
+                                               args.stop_extra)
     with open(os.path.join(args.out, 'expected_trace.pkl'), 'wb') as fh:
         pickle.dump(dict(rec=rec, wrr=wrr, romport=gmem.romport, ramport=gmem.ramport), fh)
-    print(f'program: {ncycles} instruction cycles, {len(rec)} clock periods; '
-          f'WRR outputs: {[v for _, v in wrr]}; final ROM port 0 = {gmem.romport[0]}')
+    if not info['stopped_at_label']:
+        print(f'note: label {args.stop_at} not reached within {ncycles} instruction cycles; the '
+              f'SPICE window is {ncycles} cycles long (use --stop-at LABEL or --cycles N)')
+    print(f'gate-level run of the generated netlist: {ncycles} instruction cycles, '
+          + ('matches the ISA model at every instruction' if info['match']
+             else 'DOES NOT MATCH the ISA model (please report)'))
+    log = info['iolog']
+    if log:
+        print('output-port writes (instruction cycle: value):')
+        for c, op, where, v in log[:60]:
+            print(f'  {c:7d}  {op} {where} <- {v}')
+        if len(log) > 60:
+            print(f'  ... {len(log) - 60} more (listed in the decks)')
+    nper = len(rec)
+    hours = nper * 2.5 / 3600
+    print(f'SPICE window: {nper} clock periods = {nper * 1.35e-3:.2f} ms of chip time; '
+          f'expect roughly {hours:.1f} h in ngspice on one core (~2.5 s per period)')
 
 
 if __name__ == '__main__':
