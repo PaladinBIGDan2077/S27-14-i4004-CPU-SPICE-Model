@@ -1203,7 +1203,7 @@ XG714 rf_wd3_b2 n524 vss vdd PINV
 .param VDDV=-15
 .param TCLK=1.35u TPW=0.4u TD1=0.4u TRF=20n
 .param CBUS=10p CLOAD=10p
-.param NPER=168
+.param NPER=52008
 .param TSTOP={NPER*TCLK}
 
 * the CPU, pins in DIP order 1..16 (pin 5 VSS = ground, pin 12 VDD)
@@ -2042,11 +2042,26 @@ NMEM d0 d1 d2 d3 phi1 phi2 sync reset cmrom cmram0 rport mport mcs4mem_m
 *  Expected WRR (ROM port 0) outputs, bus value during X2:
 *   period   70: port <-  0 (0000)
 *   period  142: port <-  1 (0001)
+*   period 1782: port <-  2 (0010)
+*   period 2422: port <-  3 (0011)
+*   period 4302: port <-  4 (0100)
+*   period 4982: port <-  5 (0101)
+*   period 5390: port <-  6 (0110)
+*   period 5806: port <-  7 (0111)
+*   period 45870: port <- 10 (1010)
 *
 *  Output-port writes expected from the ISA model (instruction cycle: value):
 *   cycle      6: WMP RAM bank 0 chip 0 <- 0
 *   cycle      7: WRR ROM port 0 <- 0
 *   cycle     16: WRR ROM port 0 <- 1
+*   cycle    221: WRR ROM port 0 <- 2
+*   cycle    301: WRR ROM port 0 <- 3
+*   cycle    536: WRR ROM port 0 <- 4
+*   cycle    621: WRR ROM port 0 <- 5
+*   cycle    672: WRR ROM port 0 <- 6
+*   cycle    724: WRR ROM port 0 <- 7
+*   cycle   5728: WMP RAM bank 0 chip 0 <- 1
+*   cycle   5732: WRR ROM port 0 <- 10
 
 .save v(d0) v(d1) v(d2) v(d3) v(sync) v(cmrom) v(cmram0) v(cmram1) v(cmram2) v(cmram3) v(phi1) v(phi2) v(reset) v(busval) v(rport) v(mport) i(vvdd)
 .tran {TCLK/40} {TSTOP} 0 {TCLK/40}
@@ -2056,7 +2071,14 @@ pre_osdi mcs4mem.osdi
 run
 meas tran port_out1 FIND v(rport) AT=9.652500e-05
 meas tran port_out2 FIND v(rport) AT=1.937250e-04
-meas tran idd_avg AVG i(vvdd) FROM=1.0800e-05 TO=2.268000e-04
+meas tran port_out3 FIND v(rport) AT=2.407725e-03
+meas tran port_out4 FIND v(rport) AT=3.271725e-03
+meas tran port_out5 FIND v(rport) AT=5.809725e-03
+meas tran port_out6 FIND v(rport) AT=6.727725e-03
+meas tran port_out7 FIND v(rport) AT=7.278525e-03
+meas tran port_out8 FIND v(rport) AT=7.840125e-03
+meas tran port_out9 FIND v(rport) AT=6.192652e-02
+meas tran idd_avg AVG i(vvdd) FROM=1.0800e-05 TO=7.021080e-02
 write i4004_pmos_va.raw v(d0) v(d1) v(d2) v(d3) v(sync) v(cmrom) v(cmram0) v(cmram1) v(cmram2) v(cmram3) v(phi1) v(phi2) v(reset) v(rport) v(mport) v(busval) i(vvdd)
 .endc
 .end
