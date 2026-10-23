@@ -2334,13 +2334,13 @@ def make_decks(chip, lib, rom, listing, labels, outdir, nchips=4, max_cycles=100
         comment += '\n'.join(f'*   cycle {c:6d}: {op} {where} <- {v}' for c, op, where, v in info['iolog'][:300])
         comment += '\n'
     long_run = nper > LONG_RUN
-    save_note = ('* long run: only the pins are saved (delete the .save line to keep every node)'
-                 if long_run else
-                 '* uncomment the .save line for long runs (keeps the output file small)')
+    save_note = ('* Only the pins are saved, which keeps the .raw file small (saving all ~4000 nodes\n'
+                 '* gives a GB-sized file).  To probe internal nodes, add them to the .save line,\n'
+                 '* e.g.  V(xcpu.acc0)  -- or delete the line to keep every node.')
 
     # ---------------- LTSpice (PWL memory playback)
     lt = [TITLE_LT, DEVICE_KNOBS, lib, common, pwl_memory(rec), comment, save_note,
-          ('' if long_run else '*') + '.save ' + SAVE_VECS.replace('v(', 'V(') + ' I(VVDD)']
+          '.save ' + SAVE_VECS.replace('v(', 'V(') + ' I(VVDD)']
     for k, (p, v) in enumerate(wrr[:40]):
         lt.append(f'.meas TRAN PORT_OUT{k+1} FIND V(busval) AT={{({p}+0.8)*TCLK}}')
     lt.append(f'.meas TRAN IDD_AVG AVG I(VVDD) FROM={{{RESET_PERIODS}*TCLK}} TO={{TSTOP}}')
